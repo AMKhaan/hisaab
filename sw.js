@@ -1,6 +1,6 @@
 // Opens the app instantly from saved files, even with no signal.
 // Files refresh in the background, so an update shows on the next open.
-const CACHE = 'hisaab-v2';
+const CACHE = 'hisaab-v4';
 const FILES = ['./', 'index.html', 'style.css', 'app.js', 'config.js', 'manifest.json', 'icon-192.png', 'icon-512.png'];
 
 self.addEventListener('install', (e) => {

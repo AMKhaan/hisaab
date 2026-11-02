@@ -12,6 +12,7 @@ const S = {
   view: 'home',
   form: null,
   join: null,
+  settlerDraft: null,           // { id, names } picked but not sent yet
   syncing: false,
   sending: new Set(),           // ids of changes on their way to the Sheet
   offline: false,
@@ -35,11 +36,17 @@ const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => (
   { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
 ));
 const group = () => S.groups[S.current];
+const myRole = () => (group().state.members.find((m) => m.name === group().me) || {}).role || '';
+const isAdmin = () => ['creator', 'admin'].includes(myRole());
 const money = (n) => {
   const sign = n < 0 ? '-' : '';
   const cur = group() ? group().state.group.currency : 'Rs';
-  return `${sign}${cur} ${Math.abs(n).toLocaleString('en-PK', { maximumFractionDigits: 2 })}`;
+  const digits = Math.round(Math.abs(n) * 100) % 100 ? 2 : 0;
+  return `${sign}${cur} ${Math.abs(n).toLocaleString('en-PK', { minimumFractionDigits: digits, maximumFractionDigits: 2 })}`;
 };
+const nameJoin = (names) => (names.length < 2
+  ? names.join('')
+  : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`);
 const today = () => {
   const d = new Date();
   return new Date(d - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
@@ -90,26 +97,34 @@ async function api(action, data) {
 
 /* ---------- Same sums as calculate_ and settle_ in Code.gs. Keep the two in step. ---------- */
 
-function calculate(memberNames, expenses) {
-  const people = {};
+function calculate(memberNames, expenses, settlers) {
+  const people = Object.create(null);
   const person = (name) => (people[name] = people[name] || { name, paid: 0, share: 0, net: 0 });
   memberNames.forEach(person);
+  const chosen = settlers && settlers.length ? settlers : null;
+  if (chosen) chosen.forEach(person);
 
   let total = 0;
-  const categories = {};
+  const categories = Object.create(null);
+  let counter = 0; // the spare cents rotate between entries, so the same settler is not always rounded up
   expenses.forEach((e) => {
     const cents = Math.round(e.amount * 100);
-    const base = Math.floor(cents / e.splitWith.length);
-    const extra = cents - base * e.splitWith.length;
     const isExpense = e.kind === 'expense';
+    const rotate = isExpense && chosen;
+    const split = rotate ? chosen : e.splitWith;
+    const n = split.length;
+    const base = Math.floor(cents / n);
+    const extra = cents - base * n;
 
     person(e.paidBy).net += cents;
     if (isExpense) person(e.paidBy).paid += cents;
-    e.splitWith.forEach((name, i) => {
-      const part = base + (i < extra ? 1 : 0);
+    split.forEach((name, i) => {
+      const gets = rotate ? ((i - counter) % n + n) % n < extra : i < extra;
+      const part = base + (gets ? 1 : 0);
       person(name).net -= part;
       if (isExpense) person(name).share += part;
     });
+    if (rotate) counter = (counter + extra) % n;
     if (isExpense) {
       total += cents;
       const key = `${e.main}|${e.sub}`;
@@ -177,13 +192,13 @@ function view() {
   });
   list.sort((a, b) => (b.date + (b.createdAt || '9')).localeCompare(a.date + (a.createdAt || '9')));
 
-  const sameBill = {};
-  const billKey = (e) => [e.date, e.amount, e.paidBy,
-    e.kind === 'payment' ? `paid|${e.splitWith[0]}` : `${e.main}|${e.sub}`].join('|');
+  const sameBill = Object.create(null);
+  const billKey = (e) => [e.date, e.amount,
+    e.kind === 'payment' ? `${e.paidBy}|paid|${e.splitWith[0]}` : `${e.main}|${e.sub}`].join('|');
   list.forEach((e) => { (sameBill[billKey(e)] = sameBill[billKey(e)] || new Set()).add(e.addedBy); });
   list.forEach((e) => { e.duplicate = sameBill[billKey(e)].size > 1; });
 
-  return { members, list, summary: calculate(members.map((m) => m.name), list) };
+  return { members, list, summary: calculate(members.map((m) => m.name), list, g.state.group.settlers) };
 }
 
 /* ---------- Sync ---------- */
@@ -223,9 +238,11 @@ function queueDelete(id) {
   const mine = itemsFor(S.current).filter((o) => o.type === 'save' && o.id === id);
   const idle = mine.find((o) => !S.sending.has(o.cid));
   const seen = g.state.expenses.find((e) => e.id === id);
+  // A save that was sent may be on the Sheet even though no reply came back.
+  const maybeThere = seen || mine.some((o) => o.attempted || S.sending.has(o.cid));
   if (idle) S.outbox = S.outbox.filter((o) => o !== idle);
-  if (!seen && !mine.some((o) => S.sending.has(o.cid))) {
-    added(); // it never reached the Sheet, so there is nothing to tell it
+  if (!maybeThere) {
+    added(); // it never left this phone, so there is nothing to tell the Sheet
     return;
   }
   S.outbox.push({
@@ -269,6 +286,9 @@ async function syncGroup(id) {
     const batch = sendable(id).slice(0, BATCH);
     if (!batch.length) return;
     S.sending = new Set(batch.map((o) => o.cid));
+    // With no network nothing leaves the phone. Any other failure may have reached the Sheet.
+    if (navigator.onLine !== false) batch.forEach((o) => { if (o.type === 'save') o.attempted = true; });
+    persist();
     update();
     const reply = await api('sync', { token: g.token, changes: batch.map(wire) });
     applyResults(reply.results);
@@ -364,6 +384,8 @@ function homeScreen() {
     </div>`;
 }
 
+const MIN_PASSWORD = 6;
+
 function createScreen() {
   return `<div class="top"><div class="top-row"><h1>New group</h1>
       <button data-act="go-home">Cancel</button></div></div>
@@ -379,7 +401,7 @@ function createScreen() {
       <label for="c-members">Other people, one name per line</label>
       <textarea class="input" id="c-members" name="members"></textarea>
       <label for="c-pass">Group password, shared with your people</label>
-      <input class="input" id="c-pass" name="password" type="password" required minlength="4" autocomplete="new-password">
+      <input class="input" id="c-pass" name="password" type="password" required minlength="${MIN_PASSWORD}" autocomplete="new-password">
       <label for="c-owner">Owner password</label>
       <input class="input" id="c-owner" name="ownerPassword" type="password" required autocomplete="off">
       <button class="btn">Create group</button>
@@ -398,13 +420,18 @@ function joinScreen() {
       </form>`;
   }
   return `<div class="welcome"><h1>${esc(j.name)}</h1><p class="muted">Who are you?</p></div>
-    <form class="page" data-form="join">
+    <div class="page">
       ${j.members.length ? `<div class="chips">${j.members.map((n) => `
-        <button type="button" class="chip" data-act="join-as" data-name="${esc(n)}">${esc(n)}</button>`).join('')}</div>
-      <label for="j-name">Not listed? Write your name</label>` : '<label for="j-name">Write your name</label>'}
-      <input class="input" id="j-name" name="name" maxlength="40" required>
-      <button class="btn">Join</button>
-    </form>`;
+        <button type="button" class="chip" data-act="join-as" data-name="${esc(n)}">${esc(n)}</button>`).join('')}</div>` : ''}
+      <p class="muted" style="margin-top:14px">Not listed? Ask an admin to add you, or to let you join from this phone.</p>
+      ${j.reclaim ? `<form data-form="reclaim">
+        <label for="j-owner">Owner password</label>
+        <input class="input" id="j-owner" name="ownerPassword" type="password" required autocomplete="off">
+        <button class="btn">Get back in</button>
+        <button type="button" class="btn plain" data-act="reclaim-cancel">Cancel</button>
+      </form>` : '<button type="button" class="btn plain" data-act="reclaim">I am the group creator</button>'}
+      ${S.groups[j.id] ? '<button type="button" class="btn plain" data-act="go-home">Not now</button>' : ''}
+    </div>`;
 }
 
 function groupScreen() {
@@ -437,7 +464,7 @@ function statusLine() {
   if (g.needsJoin) {
     return `<button class="status warn" data-act="rejoin">Join again to send ${waiting} change${plural}</button>`;
   }
-  if (stuck) return `<p class="status warn">${stuck} need${stuck === 1 ? 's' : ''} your attention</p>`;
+  if (stuck) return `<button class="status warn" data-act="to-problem">${stuck} need${stuck === 1 ? 's' : ''} your attention</button>`;
   if (S.syncing && waiting) return '<p class="status">Sending…</p>';
   const off = S.offline || !navigator.onLine;
   if (waiting) return `<p class="status">${off ? 'Offline' : 'Not sent yet'} · ${waiting} waiting</p>`;
@@ -469,11 +496,14 @@ function listTab() {
     const state = e.problem
       ? ' · <span class="bad">needs your attention</span>'
       : (e.pending ? ' · waiting to send' : '');
-    html += `<div class="entry"><button class="row" data-act="edit" data-id="${esc(e.id)}">
-      <div><div>${title}</div><div class="muted">${line}${state}</div>
+    const body = `<div><div>${title}</div><div class="muted">${line}${state}</div>
       ${e.duplicate ? '<span class="tag">Possible duplicate</span>' : ''}</div>
-      <div class="num">${money(e.amount)}</div></button>
-      ${e.problem ? '' : `<button class="del" data-act="delete-row" data-id="${esc(e.id)}" aria-label="Delete">${TRASH}</button>`}
+      <div class="num">${money(e.amount)}</div>`;
+    const mine = e.addedBy === group().me;
+    html += `<div class="entry"${e.problem ? ' data-problem' : ''}>${mine
+      ? `<button class="row" data-act="edit" data-id="${esc(e.id)}">${body}</button>`
+      : `<div class="row">${body}</div>`}
+      ${mine && !e.problem ? `<button class="del" data-act="delete-row" data-id="${esc(e.id)}" aria-label="Delete ${title}, ${esc(money(e.amount))}">${TRASH}</button>` : ''}
       </div>`;
     if (i === items.length - 1) html += '</div>';
   });
@@ -482,14 +512,40 @@ function listTab() {
 
 function balancesTab() {
   const { summary: s } = view();
-  const mains = {};
+  const me = group().me;
+  const mains = Object.create(null);
   s.categories.forEach((c) => { (mains[c.main] = mains[c.main] || []).push(c); });
+  const chosen = settlersNow();
+  const names = group().state.members.map((m) => m.name);
+  const waiting = !!S.settlerDraft && S.settlerDraft.id === S.current;
+  const gone = chosen.filter((n) => !names.includes(n));
+  const chipFor = (n) => {
+    const on = !chosen.length || chosen.includes(n);
+    return `
+    <button type="button" class="chip ${on ? 'on' : ''}" data-act="settler" data-v="${esc(n)}" aria-pressed="${on}">${esc(n)}${names.includes(n) ? '' : ' (removed)'}</button>`;
+  };
+  const pickerHelp = gone.length
+    ? `${esc(nameJoin(gone))} left the group but still ${gone.length === 1 ? 'shares' : 'share'} all expenses. Tap a name to take them out, and the others cover that share.`
+    : 'Tap a name to take them out. If everyone stays on, everyone shares.';
+  const picker = isAdmin() ? `<div class="chips${waiting ? ' sending' : ''}" role="group" aria-labelledby="settlers-title" aria-busy="${waiting}">${[...names, ...gone].map(chipFor).join('')}</div>
+    <p class="muted" style="margin-top:8px">${pickerHelp}</p>` : '';
+  const who = esc(nameJoin(chosen));
+  const rule = !chosen.length
+    ? 'Everyone shares all expenses.'
+    : (chosen.length === 1
+      ? `Only ${who} settles up. ${who} covers all expenses, and everyone else gets back what they paid.`
+      : `Only ${who} settle up. They share all expenses equally, and everyone else gets back what they paid.`);
+  const canMark = (m) => m.from === me || m.to === me
+    || (isAdmin() && !names.includes(m.from) && !names.includes(m.to));
   return `<div class="page">
+    <h2 id="settlers-title">Who settles up</h2>
+    ${picker}
+    <p class="muted" style="margin-top:8px">${rule}</p>
     <h2>Settle up</h2>
     <div class="card">${s.settle.length ? s.settle.map((m, i) => `
       <div class="row"><div><b>${esc(m.from)}</b> pays <b>${esc(m.to)}</b>
         <div class="num" style="text-align:left">${money(m.amount)}</div></div>
-        <button class="btn plain small" data-act="settle" data-i="${i}">Mark paid</button></div>`).join('')
+        ${canMark(m) ? `<button class="btn plain small" data-act="settle" data-i="${i}">Mark paid</button>` : ''}</div>`).join('')
       : '<div class="row"><div class="muted">Everyone is settled.</div></div>'}</div>
     <h2>Each person</h2>
     <div class="card">${s.people.map((p) => `
@@ -508,26 +564,47 @@ function balancesTab() {
 }
 
 function peopleTab() {
+  const g = group();
+  const creator = myRole() === 'creator';
+  const admin = isAdmin();
+  const memberButtons = (m) => {
+    const label = esc(m.name);
+    if (m.pending) return `<button class="btn danger small" data-act="drop-member" data-id="${esc(m.cid)}" aria-label="Remove ${label}">Remove</button>`;
+    if (m.role === 'creator' || m.name === g.me) return '';
+    const on = m.role === 'admin';
+    const canChange = creator || (admin && !on); // admins may act on plain members only
+    return [
+      creator && (on || m.joined) ? `<button class="btn plain small" data-act="set-admin" data-name="${label}" data-on="${on ? '' : 'yes'}" aria-label="${on ? `Remove admin from ${label}` : `Make ${label} an admin`}">${on ? 'Remove admin' : 'Make admin'}</button>` : '',
+      canChange && m.joined ? `<button class="btn plain small" data-act="reset-join" data-name="${label}" aria-label="New phone for ${label}">New phone</button>` : '',
+      canChange ? `<button class="btn danger small" data-act="remove" data-name="${label}" aria-label="Remove ${label}">Remove</button>` : '',
+    ].join('');
+  };
   const memberRow = (m) => {
-    const note = m.problem ? `<span class="bad">${esc(m.problem.message)}</span>`
-      : (m.pending ? 'Waiting to send' : (m.joined ? 'Joined' : 'Not joined yet'));
-    const button = m.pending
-      ? `<button class="btn danger small" data-act="drop-member" data-id="${esc(m.cid)}" aria-label="Remove ${esc(m.name)}">Remove</button>`
-      : `<button class="btn danger small" data-act="remove" data-name="${esc(m.name)}" aria-label="Remove ${esc(m.name)}">Remove</button>`;
-    return `<div class="row"><div>${esc(m.name)}<div class="muted">${note}</div></div>${button}</div>`;
+    const title = { creator: 'Creator', admin: 'Admin' }[m.role];
+    const status = m.pending ? 'Waiting to send' : (m.joined ? 'Joined' : 'Not joined yet');
+    const note = m.problem ? `<span class="bad">${esc(m.problem.message)}</span>` : (title ? `${title} · ${status}` : status);
+    return `<div class="row"${m.problem ? ' data-problem' : ''}><div>${esc(m.name)}<div class="muted">${note}</div></div>
+      <div class="row-actions">${memberButtons(m)}</div></div>`;
   };
   return `<div class="page">
     <h2>People in this group</h2>
     <div class="card">${view().members.map(memberRow).join('')}</div>
-    <form data-form="member" style="display:flex;gap:8px;margin-top:12px">
+    ${admin ? `<form data-form="member" style="display:flex;gap:8px;margin-top:12px">
       <input class="input" name="name" placeholder="Add a name" maxlength="40" required aria-label="Add a name">
       <button class="btn small">Add</button>
-    </form>
+    </form>` : '<p class="muted" style="margin-top:12px">Only admins can add or remove people.</p>'}
     <h2>Invite</h2>
     <div class="card pad">
       <p class="muted">Send the link, then tell them the password separately.</p>
       <button class="btn" data-act="invite">Share invite link</button>
     </div>
+    ${creator ? `<h2>Group password</h2>
+    <form class="card pad" data-form="password">
+      <p class="muted">People already in the group stay in. New people need the new password.</p>
+      <label for="p-new">New group password</label>
+      <input class="input" id="p-new" name="password" type="password" required minlength="${MIN_PASSWORD}" autocomplete="new-password">
+      <button class="btn">Change group password</button>
+    </form>` : ''}
     <button class="btn plain" data-act="leave">Remove this group from my phone</button>
   </div>`;
 }
@@ -538,25 +615,26 @@ function formScreen() {
   const cats = categoriesWithDrafts();
   const mains = [...new Set(cats.map((c) => c.main))];
   const subs = cats.filter((c) => c.main === f.main).map((c) => c.sub);
-  const names = namesForForm();
   const chip = (act, value, on) => `<button type="button" class="chip ${on ? 'on' : ''}" data-act="${act}" data-v="${esc(value)}" aria-pressed="${on}">${esc(value)}</button>`;
 
-  return `<div class="top"><div class="top-row"><h1>${f.id ? 'Edit expense' : 'Add expense'}</h1>
+  const isPayment = f.kind === 'payment';
+  const settlers = st.group.settlers || [];
+  const sharedBy = settlers.length ? settlers : f.splitWith;
+  const title = isPayment ? 'Edit payment' : (f.id ? 'Edit expense' : 'Add expense');
+
+  return `<div class="top"><div class="top-row"><h1>${title}</h1>
       <button data-act="close-form">Cancel</button></div></div>
     <form class="page" data-form="expense">
       ${f.problem ? `<p class="notice">${esc(problemText(f))}</p>` : ''}
       <label for="f-amount">Amount (${esc(st.group.currency)})</label>
       <input class="input amount" id="f-amount" inputmode="decimal" value="${esc(f.amount)}" placeholder="0" required>
-      <label>Category</label>
-      <div class="chips">${mains.map((m) => chip('main', m, m === f.main)).join('')}
+      ${isPayment ? '' : `<div class="label" id="f-main-label">Category</div>
+      <div class="chips" role="group" aria-labelledby="f-main-label">${mains.map((m) => chip('main', m, m === f.main)).join('')}
         <button type="button" class="chip add" data-act="new-main">+ New</button></div>
-      ${f.main ? `<label>Type</label>
-      <div class="chips">${subs.map((s) => chip('sub', s, s === f.sub)).join('')}
+      ${f.main ? `<div class="label" id="f-sub-label">Type</div>
+      <div class="chips" role="group" aria-labelledby="f-sub-label">${subs.map((s) => chip('sub', s, s === f.sub)).join('')}
         <button type="button" class="chip add" data-act="new-sub">+ New</button></div>` : ''}
-      <label>Paid by</label>
-      <div class="chips">${names.map((n) => chip('payer', n, n === f.paidBy)).join('')}</div>
-      <label>Shared by</label>
-      <div class="chips">${names.map((n) => chip('split', n, f.splitWith.includes(n))).join('')}</div>
+      <p class="muted" style="margin-top:12px">Paid by ${esc(f.paidBy)} · shared by ${esc(nameJoin(sharedBy))}</p>`}
       <label for="f-date">Date</label>
       <input class="input" id="f-date" type="date" value="${esc(f.date)}" required>
       <label for="f-note">Note (optional)</label>
@@ -567,27 +645,26 @@ function formScreen() {
 
 function problemText(f) {
   const p = f.problem;
-  if (p.kind === 'rejected') return `The Sheet refused this: ${p.message}. Fix it, or discard it.`;
+  if (p.kind === 'rejected') return `This could not be saved: ${p.message}. Fix it, or discard it.`;
   const who = p.by || 'Someone else';
-  if (f.deleting) return `${who} changed this entry after you deleted it.`;
-  return p.deleted ? `${who} deleted this entry after you changed it.` : `${who} changed this entry first.`;
+  if (p.deleted) return `${who} deleted this entry after you changed it.`;
+  const theirs = group().state.expenses.find((e) => e.id === f.id);
+  const amount = theirs ? ` ${who}'s amount: ${money(theirs.amount)}.` : '';
+  return `${who} changed this entry ${f.deleting ? 'after you deleted it' : 'first'}.${amount}`;
 }
 
 function formButtons(f) {
   const drop = (label) => `<button type="button" class="btn plain" data-act="drop-item">${label}</button>`;
+  const by = f.problem && f.problem.by;
+  const theirs = by ? `${esc(by)}'s` : 'theirs';
   if (f.problem && f.deleting) {
-    return `<button type="button" class="btn" data-act="use-mine">Use mine</button>${drop('Keep theirs')}`;
+    return `<button type="button" class="btn" data-act="use-mine">Delete it anyway</button>${drop(by ? `Keep ${theirs} version` : 'Keep their version')}`;
   }
-  if (f.problem && f.problem.kind === 'conflict') return `<button class="btn">Use mine</button>${drop('Keep theirs')}`;
+  if (f.problem && f.problem.deleted) return `<button class="btn">Add mine back</button>${drop('Leave it deleted')}`;
+  if (f.problem && f.problem.kind === 'conflict') return `<button class="btn">Save mine over ${theirs}</button>${drop(`Keep ${theirs}`)}`;
   if (f.problem) return `<button class="btn">Fix and send</button>${drop('Discard')}`;
   return `<button class="btn">Save</button>
       ${f.id ? '<button type="button" class="btn danger" data-act="delete">Delete</button>' : ''}`;
-}
-
-function namesForForm() {
-  const names = view().members.map((m) => m.name);
-  [S.form.paidBy, ...S.form.splitWith].forEach((n) => { if (n && !names.includes(n)) names.push(n); });
-  return names;
 }
 
 function categoriesWithDrafts() {
@@ -626,6 +703,59 @@ function keepFormValues() {
   S.form.note = document.getElementById('f-note').value;
 }
 
+/** Changes to people need signal, so the Sheet can check who is asking. */
+async function memberChange(action, data) {
+  const g = group();
+  try {
+    const reply = await api(action, { token: g.token, ...data });
+    if (reply && reply.group) g.state = reply;
+  } catch (err) {
+    if (err instanceof Offline) throw new Error('This needs signal. Try again when you are online.');
+    throw err;
+  }
+  S.gen++;
+  persist();
+  render();
+}
+
+/** What the picker shows: the choice still waiting to send, or else the stored list. */
+function settlersNow() {
+  const d = S.settlerDraft;
+  return d && d.id === S.current ? d.names : (group().state.group.settlers || []);
+}
+
+const SETTLER_PAUSE = 900;
+let settlerTimer = null;
+let settlerSending = false;
+
+/** Sends the picked list once, after the taps stop. Taps made during a send go out after it. */
+async function sendSettlers() {
+  settlerTimer = null;
+  const draft = S.settlerDraft;
+  if (!draft || settlerSending) return;
+  const g = S.groups[draft.id];
+  if (!g) { S.settlerDraft = null; return; }
+  settlerSending = true;
+  let failure = '';
+  try {
+    g.state = await api('setSettlers', { token: g.token, names: draft.names });
+    S.gen++;
+    persist();
+  } catch (err) {
+    failure = err instanceof Offline ? 'This needs signal. Try again when you are online.' : err.message;
+  }
+  settlerSending = false;
+  if (S.settlerDraft === draft) S.settlerDraft = null;
+  if (failure) {
+    S.settlerDraft = null;
+    clearTimeout(settlerTimer);
+    settlerTimer = null;
+    toast(failure);
+  }
+  update();
+  if (S.settlerDraft && settlerTimer === null) sendSettlers();
+}
+
 function saveGroup(result) {
   S.groups[result.groupId] = { token: result.token, me: result.me, state: result.state };
   history.replaceState(null, '', location.pathname);
@@ -648,6 +778,14 @@ const actions = {
   'go-create': () => { S.view = 'create'; render(); },
   open: (el) => openGroup(el.dataset.id),
   tab: (el) => { S.tab = el.dataset.id; render(); },
+  'to-problem': () => {
+    const first = itemsFor(S.current).find((o) => o.problem);
+    if (!first) return;
+    S.tab = first.type === 'member' ? 'people' : 'list';
+    render();
+    const row = document.querySelector('[data-problem]');
+    if (row) row.scrollIntoView({ block: 'center' });
+  },
   add: () => {
     const g = group();
     S.form = {
@@ -669,14 +807,6 @@ const actions = {
   'close-form': () => { S.view = 'group'; render(); },
   main: (el) => { keepFormValues(); S.form.main = el.dataset.v; S.form.sub = ''; render(); },
   sub: (el) => { keepFormValues(); S.form.sub = el.dataset.v; render(); },
-  payer: (el) => { keepFormValues(); S.form.paidBy = el.dataset.v; render(); },
-  split: (el) => {
-    keepFormValues();
-    const list = S.form.splitWith;
-    const name = el.dataset.v;
-    S.form.splitWith = list.includes(name) ? list.filter((n) => n !== name) : [...list, name];
-    render();
-  },
   'new-main': () => {
     keepFormValues();
     const name = (prompt('New category name') || '').trim();
@@ -725,22 +855,34 @@ const actions = {
       main: 'Payment', sub: 'Settle up', note: '',
     });
   },
-  remove: (el) => run(el, async () => {
-    const name = el.dataset.name;
-    if (view().list.some((e) => e.paidBy === name || e.splitWith.includes(name))) {
-      throw new Error(`${name} has entries, so they cannot be removed`);
-    }
-    if (!confirm(`Remove ${name}?`)) { el.disabled = false; return; }
-    try {
-      group().state = await api('removeMember', { token: group().token, name });
-    } catch (err) {
-      if (err instanceof Offline) throw new Error('Removing a person needs signal, to check everyone\'s entries.');
-      throw err;
-    }
-    S.gen++;
-    persist();
+  remove: (el) => {
+    const { name } = el.dataset;
+    const after = settlersNow().includes(name)
+      ? 'They keep sharing expenses until you take them out of Who settles up.'
+      : 'New expenses will not include them.';
+    if (!confirm(`Remove ${name}? Their past entries and balance stay. ${after}`)) return;
+    run(el, () => memberChange('removeMember', { name }));
+  },
+  'reset-join': (el) => {
+    const { name } = el.dataset;
+    if (!confirm(`Let ${name} join from a new phone? Their current phone will be signed out.`)) return;
+    run(el, () => memberChange('resetJoin', { name }));
+  },
+  settler: (el) => {
+    const names = group().state.members.map((m) => m.name);
+    const chosen = settlersNow();
+    const now = chosen.length ? chosen : names;
+    const name = el.dataset.v;
+    const next = now.includes(name) ? now.filter((n) => n !== name) : [...now, name];
+    if (!next.some((n) => names.includes(n))) return toast('Choose at least one person');
+    // Removed people stay in the list sent until their own chip is tapped.
+    const everyone = next.length === names.length && names.every((n) => next.includes(n));
+    S.settlerDraft = { id: S.current, names: everyone ? [] : next };
+    clearTimeout(settlerTimer);
+    settlerTimer = setTimeout(sendSettlers, SETTLER_PAUSE);
     render();
-  }),
+  },
+  'set-admin': (el) => run(el, () => memberChange('setAdmin', { name: el.dataset.name, admin: !!el.dataset.on })),
   invite: async () => {
     const url = `${location.origin}${location.pathname}?g=${encodeURIComponent(S.current)}`;
     const text = `Join ${group().state.group.name} on Hisaab`;
@@ -763,6 +905,12 @@ const actions = {
     persist();
     render();
   },
+  reclaim: () => {
+    S.join.reclaim = true;
+    render();
+    document.getElementById('j-owner').focus();
+  },
+  'reclaim-cancel': () => { S.join.reclaim = false; render(); },
   'join-as': (el) => run(el, async () => {
     saveGroup(await api('join', { groupId: S.join.id, password: S.join.password, name: el.dataset.name }));
   }),
@@ -770,20 +918,33 @@ const actions = {
 
 const forms = {
   create: (data, button) => run(button, async () => {
-    saveGroup(await api('create', {
-      ...data,
-      members: data.members.split('\n').map((n) => n.trim()).filter(Boolean),
-    }));
+    if (data.password.length < MIN_PASSWORD) throw new Error(`Password needs at least ${MIN_PASSWORD} characters`);
+    const seen = new Set([data.me.trim().toLowerCase()]);
+    const repeated = [];
+    const members = data.members.split('\n').map((n) => n.trim()).filter(Boolean).filter((n) => {
+      const key = n.toLowerCase();
+      if (seen.has(key)) { repeated.push(n); return false; }
+      seen.add(key);
+      return true;
+    });
+    saveGroup(await api('create', { ...data, members }));
+    if (repeated.length) toast(`Listed twice, so added once: ${nameJoin(repeated)}`);
+  }),
+  reclaim: (data, button) => run(button, async () => {
+    saveGroup(await api('reclaim', { groupId: S.join.id, ownerPassword: data.ownerPassword }));
+  }),
+  password: (data, button) => run(button, async () => {
+    if (data.password.length < MIN_PASSWORD) throw new Error(`Password needs at least ${MIN_PASSWORD} characters`);
+    await memberChange('changePassword', { password: data.password });
+    toast('Group password changed. Tell your people the new one.');
   }),
   verify: (data, button) => run(button, async () => {
     const info = await api('verify', { groupId: S.join.id, password: data.password });
     S.join = { ...S.join, ...info, password: data.password };
     render();
   }),
-  join: (data, button) => run(button, async () => {
-    saveGroup(await api('join', { groupId: S.join.id, password: S.join.password, name: data.name }));
-  }),
   member: (data) => {
+    if (!isAdmin()) return;
     const name = data.name.trim();
     if (!name) return;
     if (view().members.some((m) => m.name.toLowerCase() === name.toLowerCase())) { toast(`${name} is already here`); return; }
@@ -797,7 +958,6 @@ const forms = {
     const amount = Number(f.amount.replace(/,/g, ''));
     if (!(amount > 0)) return toast('Enter an amount');
     if (f.kind !== 'payment' && (!f.main || !f.sub)) return toast('Choose a category and type');
-    if (!f.splitWith.length) return toast('Choose who shares this');
     const expense = {
       id: f.id || newId(), kind: f.kind || 'expense', date: f.date, amount, paidBy: f.paidBy,
       splitWith: f.splitWith, main: f.main, sub: f.sub, note: f.note.trim(),
