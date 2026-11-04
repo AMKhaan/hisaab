@@ -190,7 +190,9 @@ function view() {
       });
     }
   });
-  list.sort((a, b) => (b.date + (b.createdAt || '9')).localeCompare(a.date + (a.createdAt || '9')));
+  // Newest date first. Within a date, the Sheet's order (rank), and an unsent entry goes on top.
+  const rank = (e) => Number(e.rank) || 1e13 - (Date.parse(e.createdAt) || Date.now());
+  list.sort((a, b) => b.date.localeCompare(a.date) || rank(a) - rank(b) || String(a.id).localeCompare(String(b.id)));
 
   const sameBill = Object.create(null);
   const billKey = (e) => [e.date, e.amount,
